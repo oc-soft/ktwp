@@ -1,0 +1,356 @@
+/*
+ * Copyright 2022 oc-soft
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+
+plugins {
+    id 'org.jetbrains.kotlin.multiplatform' 
+    id 'maven-publish'
+}
+
+repositories {
+    mavenCentral()
+    jcenter()
+}
+
+group 'net.oc_soft'
+
+version '0.1.0'
+
+
+/**
+ * snake to camel case
+ */
+String.metaClass.snakeToCamel = {
+
+   replaceAll('(_|-)([a-z])') { it[2].toUpperCase() }
+}
+
+/**
+ * create kotlin wrapper package name
+ */
+String kotlinw(String target, String version) {
+    return "org.jetbrains.kotlin-wrappers:kotlin-$target:$version"
+}
+ext.appSettings = [
+    'main': [
+        compile: ['js' ],
+        'js-name': 'main',
+        'out-name': 'main'
+    ]
+]
+
+ext.wordpressPlugins = [
+]
+
+ext.html = [:]
+
+ext.htmlCdn = [:]
+
+
+ext.browserClass = 
+    org.jetbrains.kotlin.gradle.targets.js.subtargets.KotlinBrowserJs 
+
+ext.dceDir = browserClass.DCE_DIR
+ext.dceDevDir = browserClass.DCE_DEV_DIR
+
+ext.kotlinWrapperVersion = '18.0.0-pre.328-kotlin-1.6.20'
+
+
+ext.webpackSetting = [
+    gradleBuildJs: 'gradle-build.js',
+    libraryTarget: 'umd',
+    jsProgramDir: 'js',
+    cssDir: 'css',
+    externals: [
+        kotlin: 'kotlin'
+    ]
+]
+
+ext.webpackSetting.gradleBuildPath =
+    file("webpack.config.d/00_${webpackSetting.gradleBuildJs}")
+
+ext.karmaWebpackSetting = [
+    gradleBuildPath: file("karma.config.d/00_${webpackSetting.gradleBuildJs}")
+]
+
+
+ext.buildSiteDependsMode = 'Development'
+// ext.buildSiteDependsMode = 'Production'
+
+
+ext.wp = [
+    rootDir: file('build/web-site')
+]
+
+/**
+ * get application names without default entry
+ */
+def getAppSettingsWithoutDefault() {
+    def result = [:]
+    appSettings.each {
+        key, value ->
+        if (key != 'main') {
+            result.put(key, value)
+        }
+    }
+    return result
+}
+
+
+def createCompilation(
+    def compilations,
+    def kind) {
+    appSettingsWithoutDefault.each {
+        key, value ->
+        if (value.compile.contains(kind)) {
+            compilations.create(key.snakeToCamel())
+        }
+    }
+}
+
+
+kotlin {
+
+    js {
+        createCompilation(compilations, 'js')
+        browser {
+            webpackTask {
+            }
+        }
+    }
+
+    sourceSets {
+        
+        jsMain {
+            dependencies {
+                implementation kotlin('stdlib-js')
+                compileOnly kotlinw('react-core', kotlinWrapperVersion)
+                compileOnly kotlinw('react', kotlinWrapperVersion)
+                compileOnly kotlinw('react-dom', kotlinWrapperVersion)
+            }
+        }
+        jsTest {
+            dependencies {
+                implementation kotlin('test-js')
+            }
+        }
+    }
+}
+
+
+
+/**
+ * create compiled javascript entry
+ */
+def createJsEntries(String mode) {
+    appSettingsWithoutDefault.findAll {
+        key, value ->
+        value.compile.contains('js')
+    }.collectEntries { 
+        key, value ->
+        def compilationName = key.snakeToCamel()
+        [ key, getDceOutput(compilationName, mode == 'development') ]
+    } 
+}
+
+task webpackGradleBuild {
+    doLast {
+        def buildSetting = [:] 
+        def jsEntries = [:] 
+        ['development', 'production'].each {
+            jsEntries[it]  = createJsEntries(it)
+        }        
+        buildSetting['js'] = jsEntries 
+        buildSetting['mainProgramName'] = appSettings['main']['js-name']
+        def tmp = new groovy.text.StreamingTemplateEngine()
+        def gradleBuildSrc = """
+class GradleBuild {
+  static get config() {
+    const result = <% out.print config %>;
+    return result;
+  }
+}"""
+        tmp = tmp.createTemplate(gradleBuildSrc) 
+        def jsonGenerator = new groovy.json.JsonGenerator.Options()
+            .addConverter(File.class) { it.toString() }
+            .build()
+            
+        def buildConfig = groovy.json.JsonOutput.prettyPrint(
+            jsonGenerator.toJson(buildSetting))
+        def gradleBuildContents = tmp.make([
+            config: buildConfig
+        ])
+        webpackSetting.gradleBuildPath.text = gradleBuildContents
+    }
+}
+
+
+jsBrowserDevelopmentWebpack.dependsOn webpackGradleBuild
+jsBrowserProductionWebpack.dependsOn webpackGradleBuild
+
+
+
+/**
+ * get distribution directory
+ */
+def getDistributionDir() {
+    def result = null
+    kotlin {
+        js {
+            browser {
+                distribution {
+                    result = directory
+                }
+            }
+        }
+    }
+    return result
+}
+
+/** create npm project */
+def createNpmProject(def compilation) {
+    def result = null
+    result = new org.jetbrains.kotlin.gradle.targets.js.npm.NpmProject(
+        compilation)
+    return result
+}
+
+/**
+ * kotlin compiler classpath
+ */
+def getCompilerClasspath() {
+    def result = project.objects.fileCollection()
+    def compilerClassConfigName = 'kotlinCompilerClasspath'
+    result.setFrom(
+        project.configurations.named(compilerClassConfigName))
+    return result 
+}
+
+
+/**
+ * kotlin js path
+ */
+def getKotlinJsPath() {
+    return  rootProject.file('build/js/node_modules/kotlin/kotlin.js')
+}
+
+/**
+ * run javascript deadcode elimination
+ */
+def runJsDce(
+    boolean devMode,
+    def compilation,
+    def dceDir) {
+    def npmProject = createNpmProject(compilation)
+    def destDir = new File(npmProject.dir, dceDir)
+    def source = compilation.compileKotlinTask.outputFile
+    javaexec {
+        main = 'org.jetbrains.kotlin.cli.js.dce.K2JSDce'
+        classpath = compilerClasspath 
+        args '-output-dir', destDir
+        if (devMode) {
+            args '-dev-mode' 
+        }
+        args source, kotlinJsPath
+    } 
+}
+
+
+
+/**
+ * setup dce task
+ */
+def setupDceTask(def dceTask,
+    def compilation,
+    def dceDir) {
+    def npmProject = createNpmProject(compilation)
+    dceTask.destinationDirectory = new File(npmProject.dir, dceDir)
+
+    dceTask.source(compilation.compileKotlinTask.outputFile)
+    dceTask.dependsOn compilation.compileKotlinTask
+
+}
+
+/**
+ * get javascript compilation
+ */
+def getJsCompilation(String compilationName) {
+
+    def result = null
+    kotlin.js {
+        result = compilations[compilationName.snakeToCamel()]
+    }
+        
+    return result
+}
+
+
+
+def getDceOutput(String compilationName, boolean dev) {
+    def kotlinTask = getJsCompilation(compilationName).compileKotlinTask
+    def taskName = null
+    if (dev) {
+        taskName = "${compilationName}DceDev"
+    } else {
+        taskName = "${compilationName}Dce"
+    }
+    return new File(
+        tasks.getByName(taskName).destinationDirectory,
+        kotlinTask.outputFile.name)
+}
+
+appSettingsWithoutDefault.each {
+    key, value ->
+    if (value.compile.contains('js')) {
+        def jsCompilation = getJsCompilation(key)
+        tasks.create(
+            "${key.snakeToCamel()}Dce") {
+            dependsOn jsCompilation.compileKotlinTask
+
+            jsBrowserProductionWebpack.dependsOn it 
+            doLast {
+                runJsDce(false, jsCompilation, dceDir)
+            }
+        }
+        jsBrowserProductionWebpack.inputs.files getDceOutput(
+            key.snakeToCamel(), false)
+
+        tasks.create(
+            "${key.snakeToCamel()}DceDev") {
+            dependsOn jsCompilation.compileKotlinTask
+            jsBrowserDevelopmentWebpack.dependsOn it
+            doLast {
+                runJsDce(true, jsCompilation, dceDevDir)
+            }
+        }
+        jsBrowserDevelopmentWebpack.inputs.files getDceOutput(
+            key.snakeToCamel(), true)
+    }
+}
+
+tasks.getByPath('jsBrowserProductionWebpack').mode = 'production'
+
+if (hasProperty("productionCompile")) {
+    kotlin.js {
+        compilations.each {
+            it.kotlinOptions {
+                sourceMap = false
+            }
+        }
+    }
+}
+
+
+// vi: se ts=4 sw=4 et:
